@@ -224,8 +224,8 @@ impl ComposioTool {
         connected_account_ref: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
         // Composio tool/action identifiers are annoyingly inconsistent across versions and docs.
-        // Try multiple slug candidates to avoid failing on '-' vs '_' mismatches.
-        let tool_slug_candidates = normalize_tool_slug_candidates(action_name);
+        // Pin to underscore to avoid ambiguity.
+        let tool_slug = normalize_tool_slug(action_name);
         let app_hint = app_name_hint
             .map(normalize_app_slug)
             .filter(|app| !app.is_empty())
@@ -243,19 +243,17 @@ impl ComposioTool {
         };
 
         let mut v3_errors = Vec::new();
-        for tool_slug in &tool_slug_candidates {
-            match self
-                .execute_action_v3(
-                    tool_slug,
-                    params.clone(),
-                    entity_id,
-                    resolved_account_ref.as_deref(),
-                )
-                .await
-            {
-                Ok(result) => return Ok(result),
-                Err(v3_err) => v3_errors.push(format!("{tool_slug}: {v3_err}")),
-            }
+        match self
+            .execute_action_v3(
+                &tool_slug,
+                params.clone(),
+                entity_id,
+                resolved_account_ref.as_deref(),
+            )
+            .await
+        {
+            Ok(result) => return Ok(result),
+            Err(v3_err) => v3_errors.push(format!("{tool_slug}: {v3_err}")),
         }
 
         // v2 fallback (legacy action names are typically UPPER_SNAKE_CASE)
@@ -834,38 +832,9 @@ fn normalize_entity_id(entity_id: &str) -> String {
 }
 
 fn normalize_tool_slug(action_name: &str) -> String {
-    // Composio v3 tool slugs use hyphens. Users (and some models) often supply underscores.
-    // Normalize both forms to a canonical hyphenated slug.
-    action_name
-        .trim()
-        .replace('_', "-")
-        .to_ascii_lowercase()
-}
-
-fn normalize_tool_slug_candidates(action_name: &str) -> Vec<String> {
-    let trimmed = action_name.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-
-    let mut candidates = Vec::new();
-
-    // 1) As provided
-    candidates.push(trimmed.to_string());
-
-    // 2) Canonical hyphenated, lowercased
-    let canonical = normalize_tool_slug(trimmed);
-    if !canonical.is_empty() && !candidates.contains(&canonical) {
-        candidates.push(canonical);
-    }
-
-    // 3) Underscore variant (some older docs/SDKs expose underscores)
-    let underscore = canonical.replace('-', "_");
-    if !underscore.is_empty() && !candidates.contains(&underscore) {
-        candidates.push(underscore);
-    }
-
-    candidates
+    // Pin to underscore: Composio identifiers can appear as either '-' or '_'.
+    // We normalize everything to a canonical lower_snake_case slug.
+    action_name.trim().replace('-', "_").to_ascii_lowercase()
 }
 
 fn normalize_legacy_action_name(action_name: &str) -> String {
@@ -1345,27 +1314,15 @@ mod tests {
 
     #[test]
     fn normalize_tool_slug_supports_legacy_action_name() {
-        assert_eq!(
-            normalize_tool_slug("GMAIL_FETCH_EMAILS"),
-            "gmail-fetch-emails"
-        );
-        assert_eq!(
-            normalize_tool_slug(" github-list-repos "),
-            "github-list-repos"
-        );
+        assert_eq!(normalize_tool_slug("GMAIL_FETCH_EMAILS"), "gmail_fetch_emails");
+        assert_eq!(normalize_tool_slug(" github-list-repos "), "github_list_repos");
     }
 
     #[test]
-    fn normalize_tool_slug_candidates_include_hyphen_and_underscore_variants() {
-        let candidates = normalize_tool_slug_candidates("GMAIL_SEND_EMAIL");
-        assert!(candidates.contains(&"GMAIL_SEND_EMAIL".to_string()));
-        assert!(candidates.contains(&"gmail-send-email".to_string()));
-        assert!(candidates.contains(&"gmail_send_email".to_string()));
-
-        // Already-hyphenated input should remain stable and not duplicate entries.
-        let candidates2 = normalize_tool_slug_candidates("github-list-repos");
-        assert!(candidates2.contains(&"github-list-repos".to_string()));
-        assert!(candidates2.contains(&"github_list_repos".to_string()));
+    fn normalize_tool_slug_pins_to_underscore_lowercase() {
+        assert_eq!(normalize_tool_slug("GMAIL_SEND_EMAIL"), "gmail_send_email");
+        assert_eq!(normalize_tool_slug("gmail-send-email"), "gmail_send_email");
+        assert_eq!(normalize_tool_slug(" github-list-repos "), "github_list_repos");
     }
 
     #[test]
