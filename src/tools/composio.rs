@@ -223,6 +223,8 @@ impl ComposioTool {
         entity_id: Option<&str>,
         connected_account_ref: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
+        // Composio tool/action identifiers are annoyingly inconsistent across versions and docs.
+        // Pin to underscore to avoid ambiguity.
         let tool_slug = normalize_tool_slug(action_name);
         let app_hint = app_name_hint
             .map(normalize_app_slug)
@@ -240,6 +242,7 @@ impl ComposioTool {
                 .await?
         };
 
+        let mut v3_errors = Vec::new();
         match self
             .execute_action_v3(
                 &tool_slug,
@@ -249,36 +252,38 @@ impl ComposioTool {
             )
             .await
         {
-            Ok(result) => Ok(result),
-            Err(v3_err) => {
-                let mut v2_candidates = vec![action_name.trim().to_string()];
-                let legacy_action_name = normalize_legacy_action_name(action_name);
-                if !legacy_action_name.is_empty() && !v2_candidates.contains(&legacy_action_name) {
-                    v2_candidates.push(legacy_action_name);
-                }
+            Ok(result) => return Ok(result),
+            Err(v3_err) => v3_errors.push(format!("{tool_slug}: {v3_err}")),
+        }
 
-                let mut v2_errors = Vec::new();
-                for candidate in v2_candidates {
-                    match self
-                        .execute_action_v2(&candidate, params.clone(), entity_id)
-                        .await
-                    {
-                        Ok(result) => return Ok(result),
-                        Err(v2_err) => v2_errors.push(format!("{candidate}: {v2_err}")),
-                    }
-                }
+        // v2 fallback (legacy action names are typically UPPER_SNAKE_CASE)
+        let mut v2_candidates = vec![action_name.trim().to_string()];
+        let legacy_action_name = normalize_legacy_action_name(action_name);
+        if !legacy_action_name.is_empty() && !v2_candidates.contains(&legacy_action_name) {
+            v2_candidates.push(legacy_action_name);
+        }
 
-                anyhow::bail!(
-                    "Composio execute failed on v3 ({v3_err}) and v2 fallback attempts ({}){}",
-                    v2_errors.join(" | "),
-                    build_connected_account_hint(
-                        app_hint.as_deref(),
-                        normalized_entity_id.as_deref(),
-                        resolved_account_ref.as_deref(),
-                    )
-                );
+        let mut v2_errors = Vec::new();
+        for candidate in v2_candidates {
+            match self
+                .execute_action_v2(&candidate, params.clone(), entity_id)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(v2_err) => v2_errors.push(format!("{candidate}: {v2_err}")),
             }
         }
+
+        anyhow::bail!(
+            "Composio execute failed on v3 attempts ({}) and v2 fallback attempts ({}){}",
+            v3_errors.join(" | "),
+            v2_errors.join(" | "),
+            build_connected_account_hint(
+                app_hint.as_deref(),
+                normalized_entity_id.as_deref(),
+                resolved_account_ref.as_deref(),
+            )
+        );
     }
 
     fn build_list_actions_v3_query(app_name: Option<&str>) -> Vec<(String, String)> {
@@ -827,7 +832,9 @@ fn normalize_entity_id(entity_id: &str) -> String {
 }
 
 fn normalize_tool_slug(action_name: &str) -> String {
-    action_name.trim().replace('_', "-").to_ascii_lowercase()
+    // Pin to underscore: Composio identifiers can appear as either '-' or '_'.
+    // We normalize everything to a canonical lower_snake_case slug.
+    action_name.trim().replace('-', "_").to_ascii_lowercase()
 }
 
 fn normalize_legacy_action_name(action_name: &str) -> String {
@@ -1307,14 +1314,15 @@ mod tests {
 
     #[test]
     fn normalize_tool_slug_supports_legacy_action_name() {
-        assert_eq!(
-            normalize_tool_slug("GMAIL_FETCH_EMAILS"),
-            "gmail-fetch-emails"
-        );
-        assert_eq!(
-            normalize_tool_slug(" github-list-repos "),
-            "github-list-repos"
-        );
+        assert_eq!(normalize_tool_slug("GMAIL_FETCH_EMAILS"), "gmail_fetch_emails");
+        assert_eq!(normalize_tool_slug(" github-list-repos "), "github_list_repos");
+    }
+
+    #[test]
+    fn normalize_tool_slug_pins_to_underscore_lowercase() {
+        assert_eq!(normalize_tool_slug("GMAIL_SEND_EMAIL"), "gmail_send_email");
+        assert_eq!(normalize_tool_slug("gmail-send-email"), "gmail_send_email");
+        assert_eq!(normalize_tool_slug(" github-list-repos "), "github_list_repos");
     }
 
     #[test]
