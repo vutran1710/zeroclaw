@@ -223,7 +223,9 @@ impl ComposioTool {
         entity_id: Option<&str>,
         connected_account_ref: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
-        let tool_slug = normalize_tool_slug(action_name);
+        // Composio tool/action identifiers are annoyingly inconsistent across versions and docs.
+        // Try multiple slug candidates to avoid failing on '-' vs '_' mismatches.
+        let tool_slug_candidates = normalize_tool_slug_candidates(action_name);
         let app_hint = app_name_hint
             .map(normalize_app_slug)
             .filter(|app| !app.is_empty())
@@ -240,45 +242,50 @@ impl ComposioTool {
                 .await?
         };
 
-        match self
-            .execute_action_v3(
-                &tool_slug,
-                params.clone(),
-                entity_id,
-                resolved_account_ref.as_deref(),
-            )
-            .await
-        {
-            Ok(result) => Ok(result),
-            Err(v3_err) => {
-                let mut v2_candidates = vec![action_name.trim().to_string()];
-                let legacy_action_name = normalize_legacy_action_name(action_name);
-                if !legacy_action_name.is_empty() && !v2_candidates.contains(&legacy_action_name) {
-                    v2_candidates.push(legacy_action_name);
-                }
-
-                let mut v2_errors = Vec::new();
-                for candidate in v2_candidates {
-                    match self
-                        .execute_action_v2(&candidate, params.clone(), entity_id)
-                        .await
-                    {
-                        Ok(result) => return Ok(result),
-                        Err(v2_err) => v2_errors.push(format!("{candidate}: {v2_err}")),
-                    }
-                }
-
-                anyhow::bail!(
-                    "Composio execute failed on v3 ({v3_err}) and v2 fallback attempts ({}){}",
-                    v2_errors.join(" | "),
-                    build_connected_account_hint(
-                        app_hint.as_deref(),
-                        normalized_entity_id.as_deref(),
-                        resolved_account_ref.as_deref(),
-                    )
-                );
+        let mut v3_errors = Vec::new();
+        for tool_slug in &tool_slug_candidates {
+            match self
+                .execute_action_v3(
+                    tool_slug,
+                    params.clone(),
+                    entity_id,
+                    resolved_account_ref.as_deref(),
+                )
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(v3_err) => v3_errors.push(format!("{tool_slug}: {v3_err}")),
             }
         }
+
+        // v2 fallback (legacy action names are typically UPPER_SNAKE_CASE)
+        let mut v2_candidates = vec![action_name.trim().to_string()];
+        let legacy_action_name = normalize_legacy_action_name(action_name);
+        if !legacy_action_name.is_empty() && !v2_candidates.contains(&legacy_action_name) {
+            v2_candidates.push(legacy_action_name);
+        }
+
+        let mut v2_errors = Vec::new();
+        for candidate in v2_candidates {
+            match self
+                .execute_action_v2(&candidate, params.clone(), entity_id)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(v2_err) => v2_errors.push(format!("{candidate}: {v2_err}")),
+            }
+        }
+
+        anyhow::bail!(
+            "Composio execute failed on v3 attempts ({}) and v2 fallback attempts ({}){}",
+            v3_errors.join(" | "),
+            v2_errors.join(" | "),
+            build_connected_account_hint(
+                app_hint.as_deref(),
+                normalized_entity_id.as_deref(),
+                resolved_account_ref.as_deref(),
+            )
+        );
     }
 
     fn build_list_actions_v3_query(app_name: Option<&str>) -> Vec<(String, String)> {
@@ -827,7 +834,38 @@ fn normalize_entity_id(entity_id: &str) -> String {
 }
 
 fn normalize_tool_slug(action_name: &str) -> String {
-    action_name.trim().replace('_', "-").to_ascii_lowercase()
+    // Composio v3 tool slugs use hyphens. Users (and some models) often supply underscores.
+    // Normalize both forms to a canonical hyphenated slug.
+    action_name
+        .trim()
+        .replace('_', "-")
+        .to_ascii_lowercase()
+}
+
+fn normalize_tool_slug_candidates(action_name: &str) -> Vec<String> {
+    let trimmed = action_name.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+
+    // 1) As provided
+    candidates.push(trimmed.to_string());
+
+    // 2) Canonical hyphenated, lowercased
+    let canonical = normalize_tool_slug(trimmed);
+    if !canonical.is_empty() && !candidates.contains(&canonical) {
+        candidates.push(canonical);
+    }
+
+    // 3) Underscore variant (some older docs/SDKs expose underscores)
+    let underscore = canonical.replace('-', "_");
+    if !underscore.is_empty() && !candidates.contains(&underscore) {
+        candidates.push(underscore);
+    }
+
+    candidates
 }
 
 fn normalize_legacy_action_name(action_name: &str) -> String {
@@ -1315,6 +1353,19 @@ mod tests {
             normalize_tool_slug(" github-list-repos "),
             "github-list-repos"
         );
+    }
+
+    #[test]
+    fn normalize_tool_slug_candidates_include_hyphen_and_underscore_variants() {
+        let candidates = normalize_tool_slug_candidates("GMAIL_SEND_EMAIL");
+        assert!(candidates.contains(&"GMAIL_SEND_EMAIL".to_string()));
+        assert!(candidates.contains(&"gmail-send-email".to_string()));
+        assert!(candidates.contains(&"gmail_send_email".to_string()));
+
+        // Already-hyphenated input should remain stable and not duplicate entries.
+        let candidates2 = normalize_tool_slug_candidates("github-list-repos");
+        assert!(candidates2.contains(&"github-list-repos".to_string()));
+        assert!(candidates2.contains(&"github_list_repos".to_string()));
     }
 
     #[test]
